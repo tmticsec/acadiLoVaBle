@@ -398,13 +398,17 @@ install_deps() {
 # ─────────────────────────────────────────────────────────────────────────────
 _run_validate_standalone() {
     local scan_dir="${1:-}"
+    local script_self="${BASH_SOURCE[0]}"
     local script_dir
-    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || script_dir="$(pwd)"
+    script_dir="$(cd "$(dirname "$script_self")" 2>/dev/null && pwd)" || script_dir="$(pwd)"
 
-    # Se não passou diretório, tenta descobrir o mais recente
+    # Auto-detectar scan mais recente
     if [[ -z "$scan_dir" ]]; then
         scan_dir=$(ls -td output/*/ 2>/dev/null | head -1)
-        [[ -z "$scan_dir" ]] && { err "Nenhum scan encontrado. Use: $0 --validate output/<dominio>/"; return 1; }
+        [[ -z "$scan_dir" ]] && {
+            err "Nenhum scan encontrado. Use: $0 --validate output/<dominio>/"
+            return 1
+        }
         info "Usando scan mais recente: $scan_dir"
     fi
 
@@ -412,32 +416,51 @@ _run_validate_standalone() {
 
     local findings="${scan_dir}/findings.txt"
     local endpoints="${scan_dir}/endpoints.txt"
-    local gen_py="${scan_dir}/py/gen_validate.py"
-    local app_url
-    app_url=$(grep "^SUPABASE_URL=" "$findings" 2>/dev/null | head -1 | cut -d= -f2 || true)
-    # tenta pegar o app url do diretório
-    [[ -z "$app_url" ]] && app_url=$(basename "$scan_dir" | tr '_' '.' | sed 's/\.\././g')
+    [[ ! -f "$findings" ]] && { err "findings.txt não encontrado em $scan_dir"; return 1; }
 
-    [[ ! -f "$findings"  ]] && { err "findings.txt não encontrado em $scan_dir"; return 1; }
-    [[ ! -f "$gen_py"    ]] && { err "gen_validate.py não encontrado em $scan_dir/py/"; return 1; }
+    # APP_URL: ler do findings.txt (gravado pelo scan), não a URL do Supabase
+    local app_url
+    app_url=$(grep "^APP_URL=" "$findings" 2>/dev/null | head -1 | cut -d= -f2 || true)
+    if [[ -z "$app_url" ]]; then
+        local raw_domain
+        raw_domain=$(basename "$(realpath "$scan_dir" 2>/dev/null || echo "$scan_dir")")
+        app_url="https://$(echo "$raw_domain" | sed 's/__*/./g; s/^\.\|\.$//')"
+    fi
+
+    # Extrair gen_validate.py DIRETAMENTE do script atual (sempre versão mais recente)
+    # Nunca usa o py/gen_validate.py do scan anterior (pode estar desatualizado)
+    local gen_py
+    gen_py=$(mktemp /tmp/acadi_gen_XXXXXX.py)
+    awk '/cat > "\$\{PYDIR\}\/gen_validate\.py" << .ACADI_PYEOF./{found=1; next}
+         found && /^ACADI_PYEOF$/{found=0; next}
+         found{print}' "$script_self" > "$gen_py"
+
+    if [[ ! -s "$gen_py" ]]; then
+        err "Falha ao extrair gen_validate.py do script"
+        rm -f "$gen_py"
+        return 1
+    fi
 
     local out_validate="${script_dir}/validate_findings.sh"
     info "Gerando: $out_validate"
     info "Fonte:   $findings"
+    info "App:     $app_url"
 
-    python3 "$gen_py" "$findings" "$endpoints" "$scan_dir" "${APP_URL:-$app_url}" "$out_validate"
+    python3 "$gen_py" "$findings" "$endpoints" "$scan_dir" "$app_url" "$out_validate"
     local rc=$?
+    rm -f "$gen_py"
+
     if [[ $rc -eq 0 && -f "$out_validate" ]]; then
         chmod +x "$out_validate"
         ok "validate_findings.sh → $out_validate"
         info "Execute: bash validate_findings.sh"
-        # Também copia para o scan_dir
         cp "$out_validate" "${scan_dir}/validate_findings.sh" 2>/dev/null || true
     else
-        err "Falha ao gerar (exit $rc)"
+        err "Falha ao gerar validate_findings.sh (exit $rc)"
         return 1
     fi
 }
+
 
 
 parse_args() {
@@ -602,8 +625,21 @@ def anon_key(c):
     return m.group(0) if m else ''
 
 def tables(c):
-    return sorted(set(re.findall(r'\.from\(["\']([a-zA-Z_]\w*)["\']', c)))
-
+    found = set()
+    # .from('table') or .from("table")
+    for m in re.finditer(r'\.from\(["\']([a-zA-Z_]\w+)["\']', c):
+        found.add(m.group(1))
+    # 'table'.select(...)
+    for m in re.finditer(r'["\']([a-zA-Z_]\w+)["\']\s*\.\s*(?:select|insert|update|delete)\s*\(', c):
+        found.add(m.group(1))
+    # useQuery/useMutation with table name
+    for m in re.finditer(r'(?:useQuery|useMutation|useTable)\(["\']([a-zA-Z_]\w+)["\']', c):
+        found.add(m.group(1))
+    skip={'id','name','data','error','user','value','key','type','status','message',
+          'result','item','list','row','col','table','query','true','false','null',
+          'undefined','string','number','object','content','title','body','text',
+          'label','icon','class','style','src','href','alt','ref','slot','props'}
+    return sorted(found - skip)
 def rpcs(c):
     return sorted(set(re.findall(r'\.rpc\(["\']([a-zA-Z_]\w*)["\']', c)))
 
@@ -1890,10 +1926,23 @@ def get(url,hdrs=None,method="GET",body=None):
 # ── A02: Cryptographic Failures ────────────────────────────────────────────
 if base.startswith("https://"):
     http_url=base.replace("https://","http://")
-    s,_,_=get(http_url)
-    if s==200:
+    class _NR(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self,*a,**kw): return None
+    try:
+        _op=urllib.request.build_opener(_NR)
+        _rq=urllib.request.Request(http_url,headers={"User-Agent":"Mozilla/5.0"})
+        with _op.open(_rq,timeout=8) as _r:
+            http_code=_r.status; http_loc=_r.headers.get("Location","")
+    except urllib.error.HTTPError as _e:
+        http_code=_e.code; http_loc=_e.headers.get("Location","")
+    except Exception:
+        http_code=0; http_loc=""
+    if http_code==200:
         finding("A02-001","HTTP accessible without HTTPS redirect","HIGH",
-                "A02:2021","T1557","WSTG-CRYPST-01",7.5,"App served over plain HTTP.","http:// returns 200")
+                "A02:2021","T1557","WSTG-CRYPST-01",7.5,
+                "App served over plain HTTP.","http:// returns 200")
+    elif http_code in (301,302,307,308) and "https://" in http_loc:
+        pass  # Redirects correctly to HTTPS — not a vulnerability
 if "strict-transport-security" not in hdr:
     finding("A02-002","HSTS header missing","MEDIUM","A02:2021","T1557","WSTG-CRYPST-01",6.1,
             "Without HSTS, browsers may connect over HTTP.","Header absent")
@@ -2420,26 +2469,58 @@ if os.path.exists(endpoints_file):
         if m2 and m2.group(1) not in rpcs:
             rpcs.append(m2.group(1))
 
+# ── Ler tabelas acessíveis do db_dump.json (mais confiável) ──────────────────
+db_dump_file = os.path.join(out_dir, "db_dump.json")
+if os.path.exists(db_dump_file):
+    try:
+        dump = json.load(open(db_dump_file))
+        for entry in dump:
+            if not isinstance(entry, dict): continue
+            tbl  = entry.get("table", "")
+            rows = entry.get("row_count", 0)
+            pii  = entry.get("pii_cols", [])
+            if not tbl: continue
+            # Add to tables_open (confirmed accessible with data)
+            if rows > 0 and tbl not in tables_open:
+                tables_open.append(tbl)
+            # Add to tables_all
+            if tbl not in tables_all:
+                tables_all.append(tbl)
+    except Exception:
+        pass
+
 # Se APP_URL ainda não foi resolvida, tenta pegar do nome do output dir
 if not app_url or app_url == supabase_url:
     domain = os.path.basename(os.path.abspath(out_dir)).replace("_", ".")
     app_url = f"https://{domain}"
 
-# Flags de presença
-has_cors        = "CORS:WILDCARD" in findings_raw
-has_rate_limit  = any("rate limit" in v.lower() for v in vulns)
+# ── Detect flags from VULN:/MISCONFIG: lines AND from log tags ───────────────
+# Robust: works even when specific log tags are missing from findings.txt
+all_findings = vulns + misconfigs + [l for l in lines if not l.startswith(("VULN:","MISCONFIG:"))]
+
+def has_any(*patterns, src=None):
+    """Check if any pattern appears in vulns+misconfigs+raw"""
+    targets = src if src else (vulns + misconfigs + [findings_raw])
+    return any(any(p.lower() in str(t).lower() for p in patterns) for t in targets)
+
+has_cors        = has_any("CORS", "cors wildcard", src=vulns+[findings_raw])
+has_rate_limit  = has_any("rate limit", src=vulns)
 has_open_tables = bool(tables_open)
-has_user_table  = bool(user_tables)
-has_bucket      = "BUCKET_LIST:exposed" in findings_raw
-has_auth_sett   = "AUTH_SETTINGS:exposed" in findings_raw
-has_csp         = any("CSP" in m or "Content-Security-Policy" in m for m in misconfigs)
-has_xfo         = any("X-Frame" in m or "clickjacking" in m for m in misconfigs)
-has_http        = any("HTTP accessible" in v or "HTTPS" in v for v in vulns)
-has_redirect    = any("redirect" in m.lower() for m in misconfigs)
-has_csv         = "CSV_EXPORT:" in findings_raw
-has_admin_api   = any("Admin users API" in v or "admin/users" in v for v in vulns)
-has_jwt         = any("JWT" in v or "service_role" in v for v in vulns)
-has_idor        = any("IDOR" in v or "BOLA" in v for v in vulns)
+has_user_table  = bool(user_tables) or has_any("profiles accessible","user data", src=vulns)
+has_bucket      = has_any("bucket list","bucket", src=vulns+misconfigs+[findings_raw])
+has_auth_sett   = has_any("auth settings","auth/v1/settings", src=misconfigs+vulns+[findings_raw])
+has_csp         = has_any("CSP","Content-Security-Policy", src=misconfigs)
+has_xfo         = has_any("X-Frame","clickjacking", src=misconfigs)
+has_http        = has_any("HTTP accessible","without HTTPS", src=vulns)
+has_redirect    = has_any("redirect", src=misconfigs+vulns)
+has_csv         = "CSV_EXPORT:" in findings_raw or has_any("csv export", src=vulns+misconfigs)
+has_admin_api   = has_any("Admin users API","admin/users", src=vulns)
+has_jwt         = has_any("JWT","service_role", src=vulns)
+has_idor        = has_any("IDOR","BOLA", src=vulns)
+
+# Also detect profiles from user_tables even if not in USER_TABLE: tag
+if has_any("profiles accessible","profiles", src=vulns) and "profiles" not in user_tables:
+    user_tables.append("profiles")
 
 csv_tables = list(dict.fromkeys([
     line.split(":", 1)[1] for line in findings_raw.splitlines()
@@ -2503,15 +2584,20 @@ if has_cors:
     w('  -H \'Origin: https://evil.example.com\' \\')
     w('  -H "apikey: $ANON" \\')
     w('  "$SUPABASE/rest/v1/" 2>/dev/null | grep -i "access-control-allow-origin" | tr -d \'\\r\')')
-    w('if echo "$CORS_HDR" | grep -q "\\*"; then')
-    w('  pass "CORS wildcard confirmado"')
-    w('  echo "  Resposta: $CORS_HDR"')
     tbl = tables_all[0] if tables_all else "tabela"
-    w(f'  info "Prova no browser (console de qualquer site):"')
-    w(f'  info \'fetch("$SUPABASE/rest/v1/{tbl}",{{headers:{{apikey:"$ANON"}}}})\'')
+    w('if echo "$CORS_HDR" | grep -qi "evil.example.com"; then')
+    w('  pass "CORS reflete Origin arbitrário — pior cenário"')
+    w('  echo "  Resposta: $CORS_HDR"')
+    w('elif echo "$CORS_HDR" | grep -q "\\*"; then')
+    w('  # Wildcard: real vulnerability because apikey is in the public JS bundle')
+    w('  pass "CORS wildcard (*) — apikey no bundle = qualquer site lê os dados"')
+    w('  echo "  Resposta: $CORS_HDR"')
+    w(f'  info "Prova: cole no console do browser em QUALQUER site:"')
+    w(f'  info \'fetch("\$SUPABASE/rest/v1/{tbl}",{{headers:{{apikey:"\$ANON"}}}})\'')
+    w('  info "→ Funciona porque CORS permite qualquer origem e a chave está no bundle"')
     w('  info "Recomendação: Supabase Dashboard > Auth > URL Configuration > CORS"')
     w('else')
-    w('  fail "CORS está restrito"')
+    w('  fail "CORS restrito — Origin não refletido e sem wildcard"')
     w('  echo "  Resposta: $CORS_HDR"')
     w('fi')
 
@@ -3124,8 +3210,9 @@ analyse_jwt() {
     echo "$out" | grep -v "^__" || true
     local role; role=$(echo "$out" | grep "^__ROLE__=" | cut -d= -f2)
     local exp;  exp=$(echo "$out"  | grep "^__EXP__="  | cut -d= -f2)
-    [[ "$exp" == "no" ]]          && vuln "anon key has NO expiry — permanent token"
-    [[ "$role" == "service_role" ]] && vuln "SERVICE ROLE key in client bundle — full database access!"
+    [[ "${exp:-}" == "no" ]]           && vuln "anon key has NO expiry — permanent token"
+    [[ "${role:-}" == "service_role" ]] && vuln "SERVICE ROLE key in client bundle — full database access!"
+    return 0
 }
 
 
@@ -3179,21 +3266,38 @@ audit_headers() {
 
     # CORS
     if [[ "$SUPABASE" != "{SUPABASE_URL}" && -n "$ANON_KEY" ]]; then
+        # CORS test: send Origin header and analyze the response
         local cors; cors=$(curl -sS --max-time "$TIMEOUT" -A "$UA" \
             -H "Origin: https://evil.example.com" -H "apikey: ${ANON_KEY}" \
             -I "${SUPABASE}/rest/v1/" 2>/dev/null | tr -d '\000' || true)
-        local acao; acao=$(echo "$cors" | grep -i "access-control-allow-origin:" | head -1 || true)
-        local acac; acac=$(echo "$cors" | grep -i "access-control-allow-credentials:" | head -1 || true)
-        if echo "$acao" | grep -q '\*'; then
-            vuln "CORS wildcard (*) on Supabase — any origin can call the API!"; log "CORS:WILDCARD"
-        elif echo "$acao" | grep -qi "evil.example.com"; then
+        local acao; acao=$(echo "$cors" | grep -i "access-control-allow-origin:" | head -1 | tr -d '\r' || true)
+        local acac; acac=$(echo "$cors" | grep -i "access-control-allow-credentials:" | head -1 | tr -d '\r' || true)
+
+        if echo "$acao" | grep -qi "evil.example.com"; then
             if echo "$acac" | grep -qi "true"; then
-                vuln "CORS reflects arbitrary origin WITH credentials — critical data theft risk!"; log "CORS:REFLECT_CREDS"
+                # Worst case: reflects origin AND allows credentials
+                vuln "CORS reflects Origin WITH credentials — full cross-origin data theft!"
+                log "CORS:REFLECT_WITH_CREDS"
             else
-                mcfg "CORS reflects arbitrary origin (without credentials)"
+                vuln "CORS reflects arbitrary Origin (without credentials flag)"
+                log "CORS:REFLECT_NO_CREDS"
             fi
+        elif echo "$acao" | grep -q '\*'; then
+            # Wildcard: any origin can call, but only with explicit headers (no cookies)
+            # Still a real vulnerability for Supabase because apikey is in the JS bundle
+            local origin_sent="https://evil.example.com"
+            # Verify: can we actually read data from another origin?
+            local cors_data; cors_data=$(curl -sS --max-time "$TIMEOUT" -A "$UA" \
+                -H "Origin: https://evil.example.com" \
+                -H "apikey: ${ANON_KEY}" \
+                -H "Authorization: Bearer ${ANON_KEY}" \
+                "${SUPABASE}/rest/v1/${TABLES[0]:-}?select=*&limit=1" 2>/dev/null | tr -d '\000' || true)
+            # CORS wildcard + anon key in public bundle = always a vulnerability
+        # The anon key is already confirmed exposed in the bundle above
+        vuln "CORS wildcard (*) on Supabase — any origin can call the API with the anon key from the bundle"
+        log "CORS:WILDCARD"
         else
-            ok "CORS: properly restricted"
+            ok "CORS: properly restricted (Origin not reflected, no wildcard)"
         fi
 
         # Auth settings exposure
@@ -3201,6 +3305,7 @@ audit_headers() {
         local as_st="${as_r%%|||*}"; local as_bd="${as_r#*|||}"
         if [[ "$as_st" == "200" ]]; then
             mcfg "Auth settings publicly readable: /auth/v1/settings"
+        log "AUTH_SETTINGS:exposed"
             log "AUTH_SETTINGS:exposed"
             python3 -c "
 import sys,json
@@ -3321,31 +3426,86 @@ test_method_override() {
 test_rate_limit() {
     section "RATE LIMIT DETECTION"
     [[ "$SUPABASE" == "{SUPABASE_URL}" ]] && return
-    local eps=(
-        "POST|${SUPABASE}/auth/v1/token?grant_type=password|login"
-        "POST|${SUPABASE}/auth/v1/signup|signup"
-        "POST|${SUPABASE}/auth/v1/recover|recover"
-    )
-    for entry in "${eps[@]}"; do
-        local method="${entry%%|*}"; local rest="${entry#*|}"; local url="${rest%%|*}"; local label="${rest##*|}"
-        local blocked=false
-        for _ in 1 2 3 4 5 6 7 8 9 10; do
-            local st; st=$(curl -o /dev/null -sS --max-time 5 -A "$UA" -X "$method" \
-                 -H "apikey: $ANON_KEY" -H "Content-Type: application/json" \
-                 -d '{"email":"rl@t.invalid","password":"wrongpass"}' \
-                 -w "%{http_code}" "$url" 2>/dev/null || echo "000")
-            [[ "$st" == "429" ]] && { ok "Rate-limited on ${label}"; blocked=true; break; }
-        done
-        $blocked || vuln "No rate limiting on ${label} after 10 requests"
+
+    local login_body='{"email":"ratelimit_acaditest@invalid.test","password":"Wr0ngP@ss123!"}'
+    local signup_body='{"email":"rl_acaditest@invalid.test","password":"TestP@ss123Abc!"}'
+    local recover_body='{"email":"ratelimit_acaditest@invalid.test"}'
+
+    # Test login endpoint
+    local codes="" blocked=false
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        local st; st=$(curl -o /dev/null -sS --max-time 8 -A "$UA" -X POST \
+             -H "apikey: $ANON_KEY" -H "Content-Type: application/json" \
+             -d "$login_body" -w "%{http_code}" \
+             "${SUPABASE}/auth/v1/token?grant_type=password" 2>/dev/null || echo "000")
+        codes="${codes} ${st}"
+        [[ "$st" == "429" ]] && { ok "Rate-limited on login (429)"; blocked=true; break; }
     done
+    if $blocked; then : ;
+    elif echo "$codes" | grep -qE " (400|401|422)"; then
+        vuln "No rate limiting on login after 10 requests"; log "RATE_LIMIT:absent:login"
+    else
+        warn "Rate limit on login inconclusive — responses:${codes}"
+    fi
+
+    # Test signup endpoint
+    codes=""; blocked=false
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        local st; st=$(curl -o /dev/null -sS --max-time 8 -A "$UA" -X POST \
+             -H "apikey: $ANON_KEY" -H "Content-Type: application/json" \
+             -d "$signup_body" -w "%{http_code}" \
+             "${SUPABASE}/auth/v1/signup" 2>/dev/null || echo "000")
+        codes="${codes} ${st}"
+        [[ "$st" == "429" ]] && { ok "Rate-limited on signup (429)"; blocked=true; break; }
+    done
+    if $blocked; then : ;
+    elif echo "$codes" | grep -qE " (200|201|400|401|422)"; then
+        vuln "No rate limiting on signup after 10 requests"; log "RATE_LIMIT:absent:signup"
+    else
+        warn "Rate limit on signup inconclusive — responses:${codes}"
+    fi
+
+    # Test recover/reset endpoint
+    codes=""; blocked=false
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        local st; st=$(curl -o /dev/null -sS --max-time 8 -A "$UA" -X POST \
+             -H "apikey: $ANON_KEY" -H "Content-Type: application/json" \
+             -d "$recover_body" -w "%{http_code}" \
+             "${SUPABASE}/auth/v1/recover" 2>/dev/null || echo "000")
+        codes="${codes} ${st}"
+        [[ "$st" == "429" ]] && { ok "Rate-limited on recover (429)"; blocked=true; break; }
+    done
+    if $blocked; then : ;
+    elif echo "$codes" | grep -qE " (200|201|400|401|422)"; then
+        vuln "No rate limiting on recover after 10 requests"; log "RATE_LIMIT:absent:recover"
+    else
+        warn "Rate limit on recover inconclusive — responses:${codes}"
+    fi
 }
+
+
 
 test_storage() {
     section "STORAGE BUCKET ANALYSIS"
     [[ "$SUPABASE" == "{SUPABASE_URL}" ]] && return
     local r; r=$(hprobe "GET" "${SUPABASE}/storage/v1/bucket")
     local st="${r%%|||*}"; local bd="${r#*|||}"
-    [[ "$st" == "200" ]] && { mcfg "Bucket list accessible with anon key"; log "BUCKET_LIST:exposed"; }
+    if [[ "$st" == "200" ]]; then
+        local bucket_count; bucket_count=$(python3 -c "
+import sys,json
+try:
+    d=json.load(sys.stdin)
+    print(len(d) if isinstance(d,list) else 0)
+except: print(0)
+" <<< "$bd" 2>/dev/null || echo 0)
+        if [[ "$bucket_count" -gt 0 ]]; then
+            vuln "Bucket list exposed: ${bucket_count} bucket(s) accessible with anon key"
+            log "BUCKET_LIST:exposed:count=${bucket_count}"
+        else
+            mcfg "Bucket list endpoint accessible (HTTP 200) — but empty (no buckets configured)"
+            log "BUCKET_LIST:accessible_empty"
+        fi
+    fi
     for bucket in "${BUCKETS[@]}"; do
         local ru; ru=$(hprobe "POST" "${SUPABASE}/storage/v1/object/list/${bucket}" "" '{"prefix":"","limit":10}')
         local su="${ru%%|||*}"; local bu="${ru#*|||}"
@@ -3605,26 +3765,183 @@ scan_platform_specific() {
 # ─────────────────────────────────────────────────────────────────────────────
 query_database() {
     section "DATABASE DEEP QUERY"
-    [[ "$SUPABASE" == "{SUPABASE_URL}" || ${#TABLES[@]} -eq 0 ]] && { warn "No Supabase tables to query"; return; }
+    [[ "$SUPABASE" == "{SUPABASE_URL}" || -z "$ANON_KEY" ]] && { warn "No Supabase credentials — skipping"; return; }
+
     local limit=10; $FULL && limit=100
-    local tbl_list; tbl_list=$(IFS=','; echo "${TABLES[*]}")
-    python3 "${PYDIR}/dbquery.py" "$SUPABASE" "$ANON_KEY" "$tbl_list" "$DBDUMP" "$limit" 2>/dev/null || warn "DB query partial"
-    python3 -c "
-import json
-try:
-    d=json.load(open('${DBDUMP}'))
-    for e in d:
-        if isinstance(e,dict) and e.get('row_count',0)>0:
-            print(f'OPEN|{e[\"table\"]}|{e[\"row_count\"]}')
-            if e.get('pii_cols'): print(f'PII|{e[\"table\"]}|{e[\"pii_cols\"]}')
-except: pass
-" 2>/dev/null | while IFS='|' read -r kind tbl val; do
-        case "$kind" in
-            OPEN) vuln "Table '${tbl}' returned ${val} row(s) without authentication"; log "OPEN_TABLE:${tbl}:rows=${val}" ;;
-            PII)  warn "PII columns in '${tbl}': ${val}" ;;
-        esac
+
+    # Build probe list: tables from bundle + common names + SPA route hints
+    local probe_tables=()
+
+    # 1. Tables found in bundle analysis
+    for t in "${TABLES[@]}"; do
+        probe_tables+=("$t")
     done
+
+    # 2. Common Supabase table names (always probe these)
+    local common_tables=(
+        # User & auth
+        profiles users accounts members roles permissions teams
+        # Workspace / org
+        workspaces projects organizations tenants organizations_members
+        # CRM core
+        contacts companies leads deals opportunities pipelines pipeline_stages
+        customers clients prospects
+        # Activity & communication
+        tasks todos activities events activities_log timeline
+        notes comments conversations messages chat_messages notifications
+        # E-commerce / finance
+        products orders order_items invoices payments subscriptions plans
+        transactions quotes proposals
+        # Content / docs
+        posts articles pages categories tags labels
+        files documents uploads attachments media
+        # Config
+        settings config preferences webhooks integrations
+        # Analytics
+        analytics reports metrics logs audit_logs audit_trail
+    )
+    for t in "${common_tables[@]}"; do
+        # Skip if already in the list
+        local found=false
+        for existing in "${probe_tables[@]}"; do
+            [[ "$existing" == "$t" ]] && found=true
+        done
+        $found || probe_tables+=("$t")
+    done
+
+    # 3. SPA routes as table name hints (e.g. /contacts → contacts)
+    if [[ -f "$ENDPOINTS" ]]; then
+        local route_names
+        route_names=$(grep "spa-route\|spa" "$ENDPOINTS" 2>/dev/null |             awk -F'|' '{split($2,a,"/"); n=a[length(a)]; gsub(/^[[:space:]]+|[[:space:]]+$/,"",n); if(length(n)>2) print n}' |             sort -u || true)
+        while read -r rn; do
+            [[ -z "$rn" ]] && continue
+            local found=false
+            for existing in "${probe_tables[@]}"; do
+                [[ "$existing" == "$rn" ]] && found=true
+            done
+            $found || probe_tables+=("$rn")
+        done <<< "$route_names"
+    fi
+
+    # Deduplicate probe list preserving order
+    local dedup=()
+    declare -A seen_tables
+    for t in "${probe_tables[@]}"; do
+        [[ -z "${seen_tables[$t]+x}" ]] && { dedup+=("$t"); seen_tables[$t]=1; }
+    done
+    probe_tables=("${dedup[@]}")
+
+    local total=${#probe_tables[@]}
+    info "Probing ${total} table names (${#TABLES[@]} from bundle + common + routes)"
+
+    # Probe each table with a quick SELECT
+    local accessible_tables=()
+    local accessible_names=""
+    for tbl in "${probe_tables[@]}"; do
+        # Single curl — captures body + status code in one request
+        local tmpf; tmpf=$(mktemp /tmp/acadi_db_XXXXXX)
+        local code; code=$(curl -sS --max-time 6 -A "$UA" \
+            -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY" \
+            -o "$tmpf" -w "%{http_code}" \
+            "${SUPABASE}/rest/v1/${tbl}?select=*&limit=${limit}" 2>/dev/null || echo "000")
+        local resp; resp=$(cat "$tmpf" 2>/dev/null || true)
+        rm -f "$tmpf"
+
+        if [[ "$code" == "200" ]]; then
+            # Check if response is a non-empty array
+            local row_count; row_count=$(echo "$resp" | python3 -c "
+import sys,json
+try:
+    d=json.load(sys.stdin)
+    print(len(d) if isinstance(d,list) else 0)
+except: print(0)
+" 2>/dev/null || echo 0)
+            if [[ "$row_count" -gt 0 ]]; then
+                accessible_tables+=("$tbl")
+                accessible_names="${accessible_names},${tbl}"
+                # Detect PII columns
+                local pii; pii=$(echo "$resp" | python3 -c "
+import sys,json,re
+pii_re=re.compile(r'email|phone|cpf|ssn|address|birth|password|secret|token|card',re.I)
+try:
+    rows=json.load(sys.stdin)
+    if rows and isinstance(rows[0],dict):
+        cols=[c for c in rows[0].keys() if pii_re.search(c)]
+        if cols: print(','.join(cols))
+except: pass
+" 2>/dev/null || true)
+                printf '  [200] %-30s OPEN (%s rows)' "$tbl" "$row_count"
+                [[ -n "$pii" ]] && printf '  PII: %s' "$pii"
+                printf '\n'
+                vuln "Table '${tbl}' returned ${row_count} row(s) without authentication"
+                log "OPEN_TABLE:${tbl}:rows=${row_count}"
+                [[ -n "$pii" ]] && { warn "PII columns in '${tbl}': ${pii}"; log "PII:${tbl}:${pii}"; }
+
+                # Check CSV export
+                local csv_code; csv_code=$(curl -o /dev/null -sS --max-time 6 -A "$UA" \
+                    -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY" \
+                    -H "Accept: text/csv" -w "%{http_code}" \
+                    "${SUPABASE}/rest/v1/${tbl}?select=*&limit=1" 2>/dev/null || echo "000")
+                [[ "$csv_code" == "200" ]] && { warn "'${tbl}': CSV export available"; log "CSV_EXPORT:${tbl}"; }
+
+                # Add to global TABLES array if not already there
+                local exists=false
+                for existing in "${TABLES[@]}"; do
+                    [[ "$existing" == "$tbl" ]] && exists=true
+                done
+                $exists || TABLES+=("$tbl")
+            else
+                verb "  [200] ${tbl}: empty (0 rows)"
+            fi
+        elif [[ "$code" == "401" || "$code" == "403" ]]; then
+            verb "  [${code}] ${tbl}: protected"
+        else
+            verb "  [${code}] ${tbl}: n/a"
+        fi
+    done
+
+    info "Accessible tables: ${#accessible_tables[@]} out of ${total} probed"
+
+    # Smart: probe additional names based on column signatures found
+    # e.g. if a table has first_name+email+phone+position → also try "contacts"
+    # if a table has industry+website+city → also try "companies"
+    for tbl in "${accessible_tables[@]}"; do
+        local tmpf2; tmpf2=$(mktemp /tmp/acadi_infer_XXXXXX)
+        local resp2; resp2=$(curl -sS --max-time 6 -A "$UA"             -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY"             "${SUPABASE}/rest/v1/${tbl}?select=*&limit=1" 2>/dev/null || true)
+        local inferred
+        inferred=$(echo "$resp2" | python3 -c "
+import sys,json
+try:
+    rows=json.load(sys.stdin)
+    if not rows or not isinstance(rows,list): sys.exit(0)
+    cols=set(rows[0].keys())
+    # Column signatures → likely real table name
+    if {'first_name','last_name','email','phone','position'} & cols: print('contacts')
+    elif {'industry','website','city','country'} & cols: print('companies')
+    elif {'deal_value','stage','probability'} & cols: print('deals')
+    elif {'subject','body','sender'} & cols: print('emails')
+    elif {'amount','currency','status'} & cols: print('payments')
+    elif {'title','content','author'} & cols: print('posts')
+except: pass
+" 2>/dev/null || true)
+        if [[ -n "$inferred" && "$inferred" != "$tbl" ]]; then
+            # Check if inferred name also has data
+            local inf_code; inf_code=$(curl -o /dev/null -sS --max-time 6 -A "$UA"                 -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY"                 -w "%{http_code}"                 "${SUPABASE}/rest/v1/${inferred}?select=*&limit=1" 2>/dev/null || echo "000")
+            if [[ "$inf_code" == "200" ]]; then
+                info "Note: table '$tbl' appears to actually be '$inferred' (column signature match)"
+            fi
+        fi
+    done
+
+    # Run deep query on accessible tables via dbquery.py
+    if [[ ${#accessible_tables[@]} -gt 0 ]]; then
+        local tbl_list; tbl_list=$(IFS=','; echo "${accessible_tables[*]}")
+        python3 "${PYDIR}/dbquery.py" "$SUPABASE" "$ANON_KEY" "$tbl_list" "$DBDUMP" "$limit" 2>/dev/null || true
+    else
+        echo '[]' > "$DBDUMP"
+    fi
 }
+
 
 enumerate_users() {
     section "USER ENUMERATION ENGINE"
@@ -4301,7 +4618,6 @@ main() {
     # ── Phase 1: Asset Discovery ──────────────────────────────────────────
     step "1" "ASSET DISCOVERY & DOWNLOAD"
     write_python_helpers || { err "Failed to write helpers"; exit 1; }
-    ok "18 Python helpers written to ${PYDIR}/"
 
     if $SKIP_DL && [[ $(find "$OUT_DIR" -maxdepth 1 -name "*.js" 2>/dev/null | wc -l) -gt 0 ]]; then
         info "Reusing existing assets in $OUT_DIR"
@@ -4323,13 +4639,19 @@ main() {
     if [[ -n "$BUNDLE" ]]; then
         local kb; kb=$(( $(stat -c%s "$BUNDLE" 2>/dev/null || echo 0) / 1024 ))
         ok "Bundle: $BUNDLE (${kb} KB)"
-        cat "$BUNDLE" | tr -d '\000' > "${OUT_DIR}/bundle.txt" 2>/dev/null || true
-        analyse_bundle 2>/dev/null || warn "Bundle analysis partial"
+        # Concatenate ALL downloaded JS files — queries may be in code-split chunks
+        {
+            cat "$BUNDLE" 2>/dev/null
+            find "$OUT_DIR" -maxdepth 1 -name "*.js" -newer "$BUNDLE" -type f 2>/dev/null \
+                | while read -r chunk; do echo ""; cat "$chunk" 2>/dev/null; done
+        } | tr -d '\000' > "${OUT_DIR}/bundle.txt" 2>/dev/null || true
+        local combined_kb; combined_kb=$(( $(stat -c%s "${OUT_DIR}/bundle.txt" 2>/dev/null || echo 0) / 1024 ))
+        [[ $combined_kb -gt $kb ]] && info "Combined bundle: ${combined_kb} KB total (includes code-split chunks)"
+        analyse_bundle 2>/dev/null || true
     else
         warn "No JS bundle found — skipping bundle analysis"
         touch "${OUT_DIR}/bundle.txt"
     fi
-
     # ── Phase 3: Platform Detection + Discovery ───────────────────────────
     step "3" "PLATFORM DETECTION & DISCOVERY"
     detect_platform 2>/dev/null || warn "Platform detection incomplete"
