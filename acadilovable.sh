@@ -621,7 +621,7 @@ def supabase_url(c):
     return m.group(0) if m else ''
 
 def anon_key(c):
-    m = re.search(r'eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+', c)
+    m = re.search(r'(eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+|sb_publishable_[A-Za-z0-9_\-]{20,})', c)
     return m.group(0) if m else ''
 
 def tables(c):
@@ -1037,7 +1037,7 @@ PATHS = [
 
 SECRET_PAT = re.compile(
     r'(?:password|passwd|secret|api_?key|access_?key)\s*[=:]\s*\S+'
-    r'|eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+'
+    r'|eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+|sb_publishable_[A-Za-z0-9_\-]{20,}'
     r'|sk_live_[A-Za-z0-9]{24,}'
     r'|AKIA[0-9A-Z]{16}'
     r'|-----BEGIN (?:RSA )?PRIVATE KEY-----', re.IGNORECASE)
